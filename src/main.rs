@@ -13,9 +13,14 @@
 //!
 //! Please include instructions on how someone else can run/test your service in their own webserver or development environment.
 //!
-//! ## Run and test
-//!
-//! <TODO>
+//! ## Run
+//! 
+//! Easiest way to test solution is run `cargo run` and open http://localhost:8080/sample.zip in browser. 
+//! 
+//! To process custom json send it with `curl`:
+//! ```bash
+//! curl --request POST --data-binary "@assets/sample_files.json" http://localhost:8080/zip > ~/Downloads/sample_files.zip
+//! ```
 //!
 //! ## Implementation and decisions
 //!
@@ -23,10 +28,16 @@
 //! I choice [hyper](hyper) as base library to listening TCP port for a [`Request`'s](hyper::Request). Hyper is low-level library and allows to manipulate with [`Response`](hyper::Response) object to pipe streams to it
 //!
 //! ### Archiving
-//! <TODO>
+//! I choice [zip](zip) as library for archiving files
 //!
 //! ### Logging
 //! Every internal processes are intrumented with [`log`](log) calls with widely used channels: [`debug`](log::debug), [`info`](log::info), [`warn`](log::warn) and [`error`](log::error).
+//! 
+//! ### Future improvements
+//! - Looks like it is possible to write non-finished incoming buffer to ZipWritter. It will improve UX
+//! - Use something such as `clap` to make service configurable
+//! - Checking of file name duplicates and make them unique
+//! - Per file caching
 
 extern crate serde;
 
@@ -56,11 +67,13 @@ async fn main() -> Result<()> {
 
   let addr = "127.0.0.1:8080".parse()?;
 
+  // Wrap function as hyper service
   let make_service =
     make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(service::web_service)) });
 
   log::info!("Starting web service at {}", addr);
 
+  // Start listening
   Server::bind(&addr)
     .serve(make_service)
     .await
