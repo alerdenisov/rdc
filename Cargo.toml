@@ -8,10 +8,14 @@ edition = "2018"
 
 [dependencies]
 hyper = "0.13.7"
-serde = "1.0.115"
+serde = {version = "1.0.115", features=["derive"]}
 serde_json = "1.0.57"
 tokio = { version="0.2.22", features=["macros", "fs"]}
 tokio-util = "0.3.1"
 failure = "0.1.8"
 env_logger = "0.7.1"
 log = "0.4.11"
+zip = "0.5.6"
+futures = "0.3.5"
+bytes = "0.5.6"
+tempfile = "3.1.0"
