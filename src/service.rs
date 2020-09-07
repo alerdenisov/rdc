@@ -2,7 +2,9 @@
 
 use crate::utils::stringify;
 use crate::Result;
+use bytes::buf::BufExt as _;
 use futures::stream::StreamExt;
+use hyper::upgrade::Upgraded;
 use hyper::{Body, Method, Request, Response, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use serde::{Deserialize, Serialize};
@@ -72,41 +74,49 @@ async fn download_and_response(key: &str, files: Vec<FileDefinition>) -> Result<
   zip.start_file("files.json", options)?;
   zip.write(serde_json::to_string_pretty(&files)?.as_bytes())?;
 
-  // Begin of downloading files from definitions list
-  let len = files.len();
-  let mut index = 0;
+  let mut last: String = String::new();
   let stream = futures::stream::iter(files.into_iter().map(move |def| async move {
     log::info!("Loading file: {}", def.url);
 
     let https = HttpsConnector::new();
     let client = hyper::Client::builder().build::<_, Body>(https);
-    let uri = def.url.as_str().parse::<Uri>().unwrap();
-    let res = client.get(uri).await.unwrap();
-    let buf = hyper::body::to_bytes(res.into_body()).await.unwrap();
-
-    (def.filename, buf.to_vec())
+    let uri = def.url.as_str().parse::<Uri>()?;
+    let res = client.get(uri).await?;
+    Result::Ok((def.filename, res.into_body()))
   }))
-  .buffer_unordered(1)
-  .map(move |(filename, data)| {
-    log::info!("Loaded file {} is {} long", filename, data.len());
-    zip.start_file(filename, options)?;
-    let position = zip.write(data.as_slice())? as u64;
-    index += 1;
-
-    if index == len {
-      zip.finish()?;
+  .buffered(8)
+  .map(|r| match r {
+    Ok((filename, reader)) => reader.map(move |chunk| (filename.clone(), Some(chunk), false)),
+    Err(e) => {
+      panic!("{}", e);
     }
-
-    Result::Ok((position, index == 1))
   })
-  .map(move |result| match result {
-    Ok((seek, _)) => {
-      log::info!("Seek to file at: {}", seek);
-      let mut buf = Vec::new();
-      file_reader.read_to_end(&mut buf)?;
-      Result::Ok(buf)
+  .flatten()
+  .chain(futures::stream::once(async { (String::new(), None, true) }))
+  .map(move |(filename, chunk, end)| {
+    if let Some(chunk) = chunk {
+      let bytes = chunk?;
+      if last != filename {
+        zip.start_file(&filename, options)?;
+        last = filename.clone();
+      }
+
+      let seek = zip.write(&bytes)?;
+      Result::Ok(seek)
+    } else {
+      if end {
+        zip.finish()?;
+      }
+
+      Result::Ok(0)
     }
-    Err(e) => Result::Err(e),
+  })
+  .map(move |writed| {
+    let seek = writed?;
+    log::debug!("Seek file to {}", seek);
+    let mut buf = Vec::new();
+    file_reader.read_to_end(&mut buf)?;
+    Result::Ok(buf)
   })
   .map(move |result| match result {
     Ok(ok) => Result::Ok(ok),
@@ -115,6 +125,40 @@ async fn download_and_response(key: &str, files: Vec<FileDefinition>) -> Result<
       Result::Err(e)
     }
   });
+
+  // let stream = futures::stream::iter(files.into_iter().map(move |def| async move {
+  //   log::info!("Loading file: {}", def.url);
+
+  //   let https = HttpsConnector::new();
+  //   let client = hyper::Client::builder().build::<_, Body>(https);
+  //   let uri = def.url.as_str().parse::<Uri>().unwrap();
+  //   let res = client.get(uri).await.unwrap();
+  //   let buf = hyper::body::to_bytes(res.into_body()).await.unwrap();
+
+  //   (def.filename, buf.to_vec())
+  // }))
+  // .buffer_unordered(1)
+  // .map(move |(filename, data)| {
+  //   log::info!("Loaded file {} is {} long", filename, data.len());
+  //   zip.start_file(filename, options)?;
+  //   let position = zip.write(data.as_slice())? as u64;
+  //   index += 1;
+
+  //   if index == len {
+  //     zip.finish()?;
+  //   }
+
+  //   Result::Ok((position, index == 1))
+  // })
+  // .map(move |result| match result {
+  //   Ok((seek, _)) => {
+  //     log::info!("Seek to file at: {}", seek);
+  //     let mut buf = Vec::new();
+  //     file_reader.read_to_end(&mut buf)?;
+  //     Result::Ok(buf)
+  //   }
+  //   Err(e) => Result::Err(e),
+  // })
 
   let body = hyper::Body::wrap_stream(stream);
 
