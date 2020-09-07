@@ -2,13 +2,11 @@
 
 use crate::utils::stringify;
 use crate::Result;
-use futures::prelude::*;
 use futures::stream::StreamExt;
 use hyper::{Body, Method, Request, Response, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
-use tokio_util::codec::{BytesCodec, FramedRead};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FileDefinition {
@@ -20,21 +18,19 @@ async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Bo
   // Creates temporary file
   std::fs::remove_file("../last.zip").ok();
   let file = std::fs::File::create("../last.zip")?;
-  let mut zip = zip::ZipWriter::new(file.try_clone()?);
+
+  let mut zip = zip::ZipWriter::new(file);
   let options =
     zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
   zip.start_file("files.json", options)?;
   zip.write(serde_json::to_string_pretty(&files)?.as_bytes())?;
 
-  let mut reader = FramedRead::new(
-    tokio::fs::File::open("../last.zip").await?,
-    BytesCodec::new(),
-  );
-
   // Begin of downloading files from definitions list
   let mut left = files.len();
   let stream = futures::stream::iter(files.into_iter().map(move |def| async move {
+    log::info!("Loading file: {}", def.url);
+
     let https = HttpsConnector::new();
     let client = hyper::Client::builder().build::<_, Body>(https);
     let uri = def.url.as_str().parse::<Uri>().unwrap();
@@ -43,32 +39,40 @@ async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Bo
 
     (def.filename, buf.to_vec())
   }))
-  .buffered(8)
+  .buffer_unordered(1)
   .map(move |(filename, data)| {
     log::info!("Loaded file {} is {} long", filename, data.len());
     zip.start_file(filename, options)?;
     let seek = zip.write(data.as_slice())?;
-
     left -= 1;
 
     if left == 0 {
-      log::info!("Archive is done");
       zip.finish()?;
-    // let mut buf = Vec::new();
-    // reader.read_to_end(&mut buf)?;
-    // log::debug!("{:?}", buf);
-    // Result::Ok(buf)
-    } else {
-      // let mut buf = Vec::with_capacity(seek);
-      // reader.read_exact(&mut buf)?;
-      // log::debug!("{:?}", buf);
-      // Result::Ok(buf)
     }
 
-    Result::Ok(())
+    Result::Ok((seek, left == 0))
+  })
+  .map(move |result| match result {
+    Ok((seek, _)) => {
+      let mut reader = std::fs::File::open("../last.zip")?;
+      reader.seek(SeekFrom::Start(seek as u64))?;
+      let mut buf = Vec::new();
+      reader.read_to_end(&mut buf)?;
+
+      Result::Ok(buf)
+    }
+    Err(e) => Result::Err(e),
+  })
+  .map(move |result| match result {
+    Ok(ok) => Result::Ok(ok),
+    Err(e) => {
+      log::error!("{}", e);
+      Result::Err(e)
+    }
   });
 
-  let body = hyper::Body::wrap_stream(reader);
+  let body = hyper::Body::wrap_stream(stream);
+
   Response::builder()
     .status(StatusCode::OK)
     .body(body)
@@ -80,7 +84,7 @@ pub async fn web_service(req: Request<Body>) -> Result<Response<Body>> {
   log::debug!("{:?}", req);
   match (req.method(), req.uri().path()) {
     (&Method::GET, "/sample.zip") => {
-      let mut sample = std::fs::File::open("assets/small.json")?;
+      let mut sample = std::fs::File::open("assets/sample_files.json")?;
       let mut json = String::new();
       sample.read_to_string(&mut json)?;
       let definitions = serde_json::from_str(&json)?;
