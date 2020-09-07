@@ -6,7 +6,8 @@ use futures::stream::StreamExt;
 use hyper::{Body, Method, Request, Response, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+use tokio_util::codec::{BytesCodec, FramedRead};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FileDefinition {
@@ -14,10 +15,55 @@ struct FileDefinition {
   pub filename: String,
 }
 
-async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Body>> {
+/// RDC Web service function to pass into make_service_fn
+pub async fn web_service(req: Request<Body>) -> Result<Response<Body>> {
+  log::debug!("{:?}", req);
+  match (req.method(), req.uri().path()) {
+    (&Method::GET, "/sample.zip") => {
+      let mut sample = std::fs::File::open("assets/small.json")?;
+      let mut json = String::new();
+      sample.read_to_string(&mut json)?;
+      let definitions = serde_json::from_str(&json)?;
+      let key = format!("{:x}", md5::compute(json.as_bytes()));
+      return download_and_response(&key, definitions).await;
+    }
+    (&Method::POST, "/zip") => {
+      let buf = hyper::body::to_bytes(req.into_body()).await?;
+      let key = format!("{:x}", md5::compute(&buf));
+      return download_and_response(&key, serde_json::from_slice::<Vec<FileDefinition>>(&buf)?)
+        .await;
+    }
+
+    (method, path) => log::error!("Unhandled request: {}, {}", method, path),
+  }
+
+  Response::builder()
+    .status(StatusCode::OK)
+    .body("Hello wolrd".into())
+    .map_err(stringify)
+}
+
+async fn download_and_response(key: &str, files: Vec<FileDefinition>) -> Result<Response<Body>> {
   // Creates temporary file
-  std::fs::remove_file("../last.zip").ok();
-  let file = std::fs::File::create("../last.zip")?;
+  // let file = tempfile::tempfile()?;
+  let path = format!(".cache/{}.zip", key);
+  let path = std::path::Path::new(&path);
+
+  // Use cached archive if available
+  if path.is_file() {
+    log::info!("Use cached version");
+    let file = tokio::fs::File::open(&path).await?;
+    let reader = FramedRead::new(file, BytesCodec::new());
+
+    let body = hyper::Body::wrap_stream(reader);
+
+    return Response::builder()
+      .status(StatusCode::OK)
+      .body(body)
+      .map_err(stringify);
+  }
+  let file = std::fs::File::create(&path)?;
+  let mut file_reader = std::fs::File::open(&path)?;
 
   let mut zip = zip::ZipWriter::new(file);
   let options =
@@ -27,7 +73,8 @@ async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Bo
   zip.write(serde_json::to_string_pretty(&files)?.as_bytes())?;
 
   // Begin of downloading files from definitions list
-  let mut left = files.len();
+  let len = files.len();
+  let mut index = 0;
   let stream = futures::stream::iter(files.into_iter().map(move |def| async move {
     log::info!("Loading file: {}", def.url);
 
@@ -43,22 +90,20 @@ async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Bo
   .map(move |(filename, data)| {
     log::info!("Loaded file {} is {} long", filename, data.len());
     zip.start_file(filename, options)?;
-    let seek = zip.write(data.as_slice())?;
-    left -= 1;
+    let position = zip.write(data.as_slice())? as u64;
+    index += 1;
 
-    if left == 0 {
+    if index == len {
       zip.finish()?;
     }
 
-    Result::Ok((seek, left == 0))
+    Result::Ok((position, index == 1))
   })
   .map(move |result| match result {
     Ok((seek, _)) => {
-      let mut reader = std::fs::File::open("../last.zip")?;
-      reader.seek(SeekFrom::Start(seek as u64))?;
+      log::info!("Seek to file at: {}", seek);
       let mut buf = Vec::new();
-      reader.read_to_end(&mut buf)?;
-
+      file_reader.read_to_end(&mut buf)?;
       Result::Ok(buf)
     }
     Err(e) => Result::Err(e),
@@ -76,30 +121,5 @@ async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Bo
   Response::builder()
     .status(StatusCode::OK)
     .body(body)
-    .map_err(stringify)
-}
-
-/// RDC Web service function to pass into make_service_fn
-pub async fn web_service(req: Request<Body>) -> Result<Response<Body>> {
-  log::debug!("{:?}", req);
-  match (req.method(), req.uri().path()) {
-    (&Method::GET, "/sample.zip") => {
-      let mut sample = std::fs::File::open("assets/sample_files.json")?;
-      let mut json = String::new();
-      sample.read_to_string(&mut json)?;
-      let definitions = serde_json::from_str(&json)?;
-      return download_and_response(definitions).await;
-    }
-    (&Method::POST, "/zip") => {
-      let buf = hyper::body::to_bytes(req.into_body()).await?;
-      return download_and_response(serde_json::from_slice::<Vec<FileDefinition>>(&buf)?).await;
-    }
-
-    (method, path) => log::error!("Unhandled request: {}, {}", method, path),
-  }
-
-  Response::builder()
-    .status(StatusCode::OK)
-    .body("Hello wolrd".into())
     .map_err(stringify)
 }
