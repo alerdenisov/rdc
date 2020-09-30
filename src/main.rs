@@ -14,9 +14,9 @@
 //! Please include instructions on how someone else can run/test your service in their own webserver or development environment.
 //!
 //! ## Run
-//! 
-//! Easiest way to test solution is run `cargo run` and open http://localhost:8080/sample.zip in browser. 
-//! 
+//!
+//! Easiest way to test solution is run `cargo run` and open http://localhost:8080/sample.zip in browser.
+//!
 //! To process custom json send it with `curl`:
 //! ```bash
 //! curl --request POST --data-binary "@assets/sample_files.json" http://localhost:8080/zip > ~/Downloads/sample_files.zip
@@ -32,7 +32,7 @@
 //!
 //! ### Logging
 //! Every internal processes are intrumented with [`log`](log) calls with widely used channels: [`debug`](log::debug), [`info`](log::info), [`warn`](log::warn) and [`error`](log::error).
-//! 
+//!
 //! ### Future improvements
 //! - Looks like it is possible to write non-finished incoming buffer to ZipWritter. It will improve UX
 //! - Use something such as `clap` to make service configurable
@@ -47,7 +47,6 @@ mod utils;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
 use tokio::fs;
-use utils::stringify;
 
 /// RDC Result type is wrapped version of [`Result`](std::result::Result)
 pub type Result<T> = std::result::Result<T, failure::Error>;
@@ -63,7 +62,7 @@ async fn main() -> Result<()> {
   env_logger::init();
 
   // prepare environment
-  prepare_environment(".cache").await?;
+  prepare_environment(".tmp").await?;
 
   let addr = "127.0.0.1:8080".parse()?;
 
@@ -71,11 +70,14 @@ async fn main() -> Result<()> {
   let make_service =
     make_service_fn(|_| async { Ok::<_, hyper::Error>(service_fn(service::web_service)) });
 
-  log::info!("Starting web service at {}", addr);
-
   // Start listening
-  Server::bind(&addr)
-    .serve(make_service)
-    .await
-    .map_err(stringify)
+  let server = Server::bind(&addr).serve(make_service);
+
+  println!("Listening on http://{}", addr);
+
+  if let Err(e) = server.await {
+    log::error!("server error: {}", e);
+  }
+
+  Ok(())
 }

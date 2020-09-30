@@ -3,11 +3,12 @@
 use crate::utils::stringify;
 use crate::Result;
 use futures::stream::StreamExt;
+use hyper::body::Bytes;
 use hyper::{Body, Method, Request, Response, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use tokio_util::codec::{BytesCodec, FramedRead};
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FileDefinition {
@@ -15,23 +16,32 @@ struct FileDefinition {
   pub filename: String,
 }
 
-/// RDC Web service function to pass into make_service_fn
+enum ZippingTask {
+  File(String),
+  Chunk(Bytes),
+  Close,
+  Panic,
+}
+
+fn random_id() -> String {
+  format!("{}", Uuid::new_v4().to_simple())
+}
+
 pub async fn web_service(req: Request<Body>) -> Result<Response<Body>> {
   log::debug!("{:?}", req);
   match (req.method(), req.uri().path()) {
     (&Method::GET, "/sample.zip") => {
+      log::info!("Request sample.zip");
       let mut sample = std::fs::File::open("assets/small.json")?;
       let mut json = String::new();
       sample.read_to_string(&mut json)?;
       let definitions = serde_json::from_str(&json)?;
-      let key = format!("{:x}", md5::compute(json.as_bytes()));
-      return download_and_response(&key, definitions).await;
+      return download_and_response(definitions).await;
     }
+
     (&Method::POST, "/zip") => {
       let buf = hyper::body::to_bytes(req.into_body()).await?;
-      let key = format!("{:x}", md5::compute(&buf));
-      return download_and_response(&key, serde_json::from_slice::<Vec<FileDefinition>>(&buf)?)
-        .await;
+      return download_and_response(serde_json::from_slice::<Vec<FileDefinition>>(&buf)?).await;
     }
 
     (method, path) => log::error!("Unhandled request: {}, {}", method, path),
@@ -43,26 +53,16 @@ pub async fn web_service(req: Request<Body>) -> Result<Response<Body>> {
     .map_err(stringify)
 }
 
-async fn download_and_response(key: &str, files: Vec<FileDefinition>) -> Result<Response<Body>> {
+async fn download_and_response(files: Vec<FileDefinition>) -> Result<Response<Body>> {
   // Creates temporary file
   // let file = tempfile::tempfile()?;
-  let path = format!(".cache/{}.zip", key);
-  let path = std::path::Path::new(&path);
+  let path = format!(".tmp/{}.zip", random_id());
 
-  // Use cached archive if available
-  if path.is_file() {
-    log::info!("Use cached version");
-    let file = tokio::fs::File::open(&path).await?;
-    let reader = FramedRead::new(file, BytesCodec::new());
+  // check if file exists
+  std::fs::remove_file(&path).ok();
 
-    let body = hyper::Body::wrap_stream(reader);
-
-    return Response::builder()
-      .status(StatusCode::OK)
-      .body(body)
-      .map_err(stringify);
-  }
   let file = std::fs::File::create(&path)?;
+
   let mut file_reader = std::fs::File::open(&path)?;
 
   let mut zip = zip::ZipWriter::new(file);
@@ -72,57 +72,55 @@ async fn download_and_response(key: &str, files: Vec<FileDefinition>) -> Result<
   zip.start_file("files.json", options)?;
   zip.write(serde_json::to_string_pretty(&files)?.as_bytes())?;
 
-  let mut last: String = String::new();
-  let stream = futures::stream::iter(files.into_iter().map(move |def| async move {
-    log::info!("Loading file: {}", def.url);
+  let stream =
+    futures::stream::iter(files.into_iter().map(move |def| async move {
+      log::info!("Loading file: {}", def.url);
 
-    let https = HttpsConnector::new();
-    let client = hyper::Client::builder().build::<_, Body>(https);
-    let uri = def.url.as_str().parse::<Uri>()?;
-    let res = client.get(uri).await?;
-    Result::Ok((def.filename, res.into_body()))
-  }))
-  .buffered(8)
-  .map(|r| match r {
-    Ok((filename, reader)) => reader.map(move |chunk| (filename.clone(), Some(chunk), false)),
-    Err(e) => {
-      panic!("{}", e);
-    }
-  })
-  .flatten()
-  .chain(futures::stream::once(async { (String::new(), None, true) }))
-  .map(move |(filename, chunk, end)| {
-    if let Some(chunk) = chunk {
-      let bytes = chunk?;
-      if last != filename {
-        zip.start_file(&filename, options)?;
-        last = filename.clone();
+      let https = HttpsConnector::new();
+      let client = hyper::Client::builder().build::<_, Body>(https);
+      let uri = def.url.as_str().parse::<Uri>()?;
+      let res = client.get(uri).await?;
+      Result::Ok((def.filename, res.into_body()))
+    }))
+    .buffered(8)
+    .map(|r| match r {
+      Ok((filename, reader)) => futures::stream::once(async { ZippingTask::File(filename) }).chain(
+        reader.map(move |chunk| match chunk {
+          Ok(bytes) => ZippingTask::Chunk(bytes),
+          Err(_) => ZippingTask::Panic,
+        }),
+      ),
+      Err(e) => {
+        panic!("{}", e);
+      }
+    })
+    .flatten()
+    .chain(futures::stream::once(async { ZippingTask::Close }))
+    .map(move |task| {
+      match task {
+        ZippingTask::File(filename) => {
+          zip.start_file(&filename, options)?;
+        }
+        ZippingTask::Chunk(bytes) => {
+          zip.write(&bytes)?;
+        }
+        ZippingTask::Close => {
+          zip.finish()?;
+        }
+        ZippingTask::Panic => panic!(),
       }
 
-      let seek = zip.write(&bytes)?;
-      Result::Ok(seek)
-    } else {
-      if end {
-        zip.finish()?;
-      }
-
-      Result::Ok(0)
-    }
-  })
-  .map(move |writed| {
-    let seek = writed?;
-    log::debug!("Seek file to {}", seek);
-    let mut buf = Vec::new();
-    file_reader.read_to_end(&mut buf)?;
-    Result::Ok(buf)
-  })
-  .map(move |result| match result {
-    Ok(ok) => Result::Ok(ok),
-    Err(e) => {
-      log::error!("{}", e);
-      Result::Err(e)
-    }
-  });
+      Result::Ok(())
+    })
+    .map(move |_| {
+      let mut buf = Vec::new();
+      file_reader.read_to_end(&mut buf)?;
+      Result::Ok(buf)
+    })
+    .chain(futures::stream::once(async move {
+      std::fs::remove_file(&path)?;
+      Result::Ok(Vec::default())
+    }));
 
   let body = hyper::Body::wrap_stream(stream);
 
